@@ -1,0 +1,23 @@
+name: Send Schedule
+
+on:
+  schedule:
+    # Время по UTC (например, 04:15 UTC = 07:15 по МСК)
+    - cron: '15 4 * * 1-5'
+  workflow_dispatch: # Позволяет запускать вручную кнопкой
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pillow
+      - name: Run script
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python send_schedule_img.py
