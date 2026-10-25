@@ -3,80 +3,73 @@ import os
 import re
 import hashlib
 import requests
-from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from PIL import Image
 
 # ================= НАСТРОЙКИ =================
-# Секреты берутся автоматически из настроек GitHub
+# Секреты подтягиваются из репозитория GitHub Actions
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-# Страница с расписанием на сайте колледжа
+# Ссылка на страницу с расписанием (если есть прямой подраздел, можно переопределить через секрет SCHEDULE_URL)
 URL_SCHEDULE_PAGE = os.getenv("SCHEDULE_URL", "https://simfpolyteh.ru/")
 
 HASH_FILE = "last_schedule_hash.txt"
 
 
 def get_image_data_and_hash():
-    """Находит свежую картинку расписания из /api/uploads/ и считает её хеш."""
+    """Ищет файлы вида /api/uploads/<10-15 цифр>.(png|jpg) и забирает самый свежий."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
     }
 
     try:
         response = requests.get(URL_SCHEDULE_PAGE, headers=headers, timeout=20)
         if response.status_code != 200:
-            print(f"[!] Сайт вернул статус: {response.status_code}")
+            print(f"[!] Ошибка: Сайт вернул HTTP-код {response.status_code}")
             return None, None
     except Exception as e:
-        print(f"[!] Ошибка запроса к сайту: {e}")
+        print(f"[!] Ошибка подключения к сайту: {e}")
         return None, None
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    candidates = []
+    # Ищем строго: /api/uploads/ + от 10 до 15 цифр + .png/.jpg/.jpeg/.webp
+    # Любой poster.jpg, banner.jpg или logo.png этот фильтр просто проигнорирует
+    pattern = r'/api/uploads/(\d{10,15}\.(?:png|jpg|jpeg|webp))'
+    found_filenames = re.findall(pattern, response.text, re.IGNORECASE)
 
-    # 1. Поиск по тегам <img>
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        if "/api/uploads/" in src:
-            candidates.append(urljoin(URL_SCHEDULE_PAGE, src))
-
-    # 2. Поиск по ссылкам <a>
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/api/uploads/" in href and any(href.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg"]):
-            candidates.append(urljoin(URL_SCHEDULE_PAGE, href))
-
-    # 3. Поиск регулярным выражением (если ссылки лежат внутри JS/JSON скриптов)
-    found_urls = re.findall(r'(/api/uploads/\d+\.(?:png|jpg|jpeg))', response.text, re.IGNORECASE)
-    for path in found_urls:
-        candidates.append(urljoin(URL_SCHEDULE_PAGE, path))
-
-    if not candidates:
-        print("[!] Ссылки на картинки расписания не найдены на странице.")
+    if not found_filenames:
+        print("[!] Картинка расписания с цифровым ID не найдена на странице.")
         return None, None
 
-    # Убираем дубликаты и сортируем по числу (таймстемпу) в имени файла
-    candidates = sorted(list(set(candidates)))
-    latest_img_url = candidates[-1]
-    print(f"[*] Ссылка на свежее расписание: {latest_img_url}")
+    # Убираем дубликаты и сортируем по числу
+    unique_files = sorted(list(set(found_filenames)))
+    print(f"[*] Найдены файлы расписания: {unique_files}")
+
+    # Забираем самый последний добавленный файл (максимальное число)
+    latest_file = unique_files[-1]
+    latest_img_url = urljoin(URL_SCHEDULE_PAGE, f"/api/uploads/{latest_file}")
+    print(f"[*] Актуальное расписание: {latest_img_url}")
 
     try:
         img_bytes = requests.get(latest_img_url, headers=headers, timeout=25).content
         current_hash = hashlib.sha256(img_bytes).hexdigest()
         return img_bytes, current_hash
     except Exception as e:
-        print(f"[!] Ошибка загрузки картинки: {e}")
+        print(f"[!] Ошибка при скачивании файла расписания: {e}")
         return None, None
 
 
 def send_to_telegram(image_bytes):
-    """Конвертирует в чистый PNG и отправляет в Telegram документом."""
+    """Конвертирует изображение в чистый PNG и отправляет документом без сжатия."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Ошибка: Не заданы BOT_TOKEN или CHAT_ID в секретах!")
+        print("[!] Ошибка: BOT_TOKEN или CHAT_ID не найдены в переменных окружения!")
         return
 
+    # Конвертация в PNG для максимальной четкости текста
     image = Image.open(io.BytesIO(image_bytes))
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -88,21 +81,25 @@ def send_to_telegram(image_bytes):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "caption": "🔔 <b>Свежее расписание!</b>",
+        "caption": "🔔 <b>Расписание занятий обновилось!</b>",
         "parse_mode": "HTML"
     }
     files = {
         "document": ("schedule.png", output, "image/png")
     }
 
-    resp = requests.post(url, data=payload, files=files, timeout=30)
-    if resp.status_code == 200:
-        print("[+] Расписание успешно отправлено в Telegram!")
-    else:
-        print(f"[!] Ошибка отправки в TG: {resp.text}")
+    try:
+        resp = requests.post(url, data=payload, files=files, timeout=30)
+        if resp.status_code == 200:
+            print("[+] Расписание успешно улетело в Telegram!")
+        else:
+            print(f"[!] Ошибка отправки в Telegram API: {resp.text}")
+    except Exception as e:
+        print(f"[!] Ошибка HTTP-запроса к Telegram: {e}")
 
 
 def check_for_updates():
+    """Сверяет хеш скачанной картинки с предыдущим значением."""
     img_bytes, current_hash = get_image_data_and_hash()
 
     if not img_bytes or not current_hash:
@@ -114,13 +111,14 @@ def check_for_updates():
             old_hash = f.read().strip()
 
     if current_hash != old_hash:
-        print("[*] Расписание изменилось (или первый запуск). Отправка...")
+        print("[*] Обнаружено новое расписание (или первый запуск). Отправка...")
         send_to_telegram(img_bytes)
 
         with open(HASH_FILE, "w", encoding="utf-8") as f:
             f.write(current_hash)
+        print("[+] Контрольный хеш сохранён.")
     else:
-        print("[-] Изменений нет. Хеш картинки совпадает с предыдущим.")
+        print("[-] Изменений нет. Хеш совпадает с сохранённым ранее.")
 
 
 if __name__ == "__main__":
